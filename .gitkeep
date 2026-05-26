@@ -1,3 +1,338 @@
+#!/usr/bin/env python3
+"""
+LR Pick Flagger
+---------------
+A Mac app for flagging Lightroom picks from a Pixieset favorites list.
+Double-click to run, or open via: python3 LR_Pick_Flagger.py
+"""
+
+import tkinter as tk
+from tkinter import messagebox
+import sqlite3
+import os
+import re
+import shutil
+from datetime import datetime
+
+# ─── YOUR CATALOG PATH ───────────────────────────────────────────────────────
+CATALOG_PATH = "/Users/natha/Pictures/Lightroom Catalog-v13-v13-3/Old Lightroom Catalogs/Lightroom Catalog-v13-v13-3_2025-10-29 0911/Lightroom Catalog-v13-v13-3.lrcat"
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def strip_suffix(basename):
+    return re.sub(r'(_[A-Za-z]+){2}$', '', basename)
+
+
+def parse_filenames(raw_text):
+    filenames = set()
+    tokens = re.split(r'[\s,\n\r]+', raw_text.strip())
+    for token in tokens:
+        token = token.strip().strip('"').strip("'")
+        if not token:
+            continue
+        root, _ = os.path.splitext(token)
+        cleaned = strip_suffix(root if root else token)
+        if cleaned:
+            filenames.add(cleaned)
+    return filenames
+
+
+def backup_catalog():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = CATALOG_PATH.replace(".lrcat", f"_backup_{timestamp}.lrcat")
+    shutil.copy2(CATALOG_PATH, backup_path)
+    return backup_path
+
+
+def get_matching_folders(search_term):
+    conn = sqlite3.connect(CATALOG_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT f.id_local,
+               r.absolutePath || f.pathFromRoot AS fullPath
+        FROM AgLibraryFolder f
+        JOIN AgLibraryRootFolder r ON f.rootFolder = r.id_local
+    """)
+    all_folders = cursor.fetchall()
+    conn.close()
+    return [
+        (fid, fpath) for fid, fpath in all_folders
+        if search_term.lower() in (fpath or "").lower()
+    ]
+
+
+def flag_picks_in_catalog(filenames, folder_id):
+    conn = sqlite3.connect(CATALOG_PATH)
+    cursor = conn.cursor()
+    matched, not_found = [], []
+    for basename in filenames:
+        cursor.execute("""
+            SELECT ai.id_local
+            FROM Adobe_images ai
+            JOIN AgLibraryFile alf ON ai.rootFile = alf.id_local
+            WHERE alf.baseName = ? AND alf.folder = ?
+        """, (basename, folder_id))
+        rows = cursor.fetchall()
+        if rows:
+            for (image_id,) in rows:
+                cursor.execute("UPDATE Adobe_images SET pick = 1 WHERE id_local = ?", (image_id,))
+            matched.append(basename)
+        else:
+            not_found.append(basename)
+    conn.commit()
+    conn.close()
+    return matched, not_found
+
+
+# ─── UI ───────────────────────────────────────────────────────────────────────
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("LR Pick Flagger")
+        self.resizable(False, False)
+        self.configure(bg="#1C1C1E")
+        self.geometry("520x600")
+
+        # Center on screen
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - 260
+        y = (self.winfo_screenheight() // 2) - 300
+        self.geometry(f"+{x}+{y}")
+
+        self._selected_folder_id = None
+        self._selected_folder_path = None
+        self._folder_matches = []
+
+        self._build_ui()
+
+    def _build_ui(self):
+        pad = {"padx": 24, "pady": 0}
+
+        # Title
+        tk.Label(
+            self, text="LR Pick Flagger",
+            bg="#1C1C1E", fg="#FFFFFF",
+            font=("Georgia", 22, "bold")
+        ).pack(pady=(28, 4))
+
+        tk.Label(
+            self, text="Flag Pixieset favorites as picks in Lightroom",
+            bg="#1C1C1E", fg="#888888",
+            font=("Helvetica Neue", 11)
+        ).pack(pady=(0, 24))
+
+        # Divider
+        tk.Frame(self, bg="#2C2C2E", height=1).pack(fill="x", **pad)
+
+        # ── Pixieset paste area
+        tk.Label(
+            self, text="1  Paste Pixieset Lightroom Copy List",
+            bg="#1C1C1E", fg="#EBEBF5",
+            font=("Helvetica Neue", 12, "bold"),
+            anchor="w"
+        ).pack(fill="x", padx=24, pady=(20, 6))
+
+        self.paste_box = tk.Text(
+            self, height=7, wrap="word",
+            bg="#2C2C2E", fg="#FFFFFF",
+            insertbackground="#FFFFFF",
+            relief="flat", bd=0,
+            font=("Menlo", 11),
+            padx=12, pady=10
+        )
+        self.paste_box.pack(fill="x", padx=24)
+        self.paste_box.insert("1.0", "Paste your filenames here...")
+        self.paste_box.bind("<FocusIn>", self._clear_placeholder)
+        self.paste_box.configure(fg="#555555")
+
+        # ── Shoot folder
+        tk.Label(
+            self, text="2  Shoot Folder Keyword",
+            bg="#1C1C1E", fg="#EBEBF5",
+            font=("Helvetica Neue", 12, "bold"),
+            anchor="w"
+        ).pack(fill="x", padx=24, pady=(20, 6))
+
+        folder_row = tk.Frame(self, bg="#1C1C1E")
+        folder_row.pack(fill="x", padx=24)
+
+        self.folder_entry = tk.Entry(
+            folder_row,
+            bg="#2C2C2E", fg="#FFFFFF",
+            insertbackground="#FFFFFF",
+            relief="flat", bd=0,
+            font=("Helvetica Neue", 12),
+        )
+        self.folder_entry.pack(side="left", fill="x", expand=True, ipady=10, ipadx=12)
+        self.folder_entry.insert(0, "e.g. Tea Garden, Sarah Grad")
+        self.folder_entry.bind("<FocusIn>", self._clear_folder_placeholder)
+        self.folder_entry.configure(fg="#555555")
+
+        self.search_btn = tk.Button(
+            folder_row, text="Search",
+            bg="#3A3A3C", fg="#FFFFFF",
+            relief="flat", bd=0,
+            font=("Helvetica Neue", 11),
+            padx=14, pady=8,
+            cursor="hand2",
+            command=self._search_folder
+        )
+        self.search_btn.pack(side="left", padx=(8, 0))
+
+        # Folder result label
+        self.folder_result = tk.Label(
+            self, text="",
+            bg="#1C1C1E", fg="#30D158",
+            font=("Helvetica Neue", 11),
+            anchor="w", wraplength=470
+        )
+        self.folder_result.pack(fill="x", padx=24, pady=(6, 0))
+
+        # Folder picker (hidden until multiple matches)
+        self.folder_var = tk.StringVar()
+        self.folder_picker_frame = tk.Frame(self, bg="#1C1C1E")
+        self.folder_listbox = tk.Listbox(
+            self.folder_picker_frame,
+            bg="#2C2C2E", fg="#FFFFFF",
+            selectbackground="#0A84FF",
+            relief="flat", bd=0,
+            font=("Menlo", 10),
+            height=4
+        )
+        self.folder_listbox.pack(fill="x", padx=24)
+        self.folder_listbox.bind("<<ListboxSelect>>", self._pick_folder)
+
+        # ── Run button
+        self.run_btn = tk.Button(
+            self, text="Flag Picks in Lightroom",
+            bg="#0A84FF", fg="#FFFFFF",
+            relief="flat", bd=0,
+            font=("Helvetica Neue", 13, "bold"),
+            pady=14,
+            cursor="hand2",
+            command=self._run
+        )
+        self.run_btn.pack(fill="x", padx=24, pady=(24, 0))
+
+        # ── Status
+        self.status = tk.Label(
+            self, text="",
+            bg="#1C1C1E", fg="#EBEBF5",
+            font=("Helvetica Neue", 12),
+            wraplength=470
+        )
+        self.status.pack(pady=(16, 0), padx=24)
+
+    def _clear_placeholder(self, event):
+        if self.paste_box.get("1.0", "end-1c") == "Paste your filenames here...":
+            self.paste_box.delete("1.0", "end")
+            self.paste_box.configure(fg="#FFFFFF")
+
+    def _clear_folder_placeholder(self, event):
+        if self.folder_entry.get().startswith("e.g."):
+            self.folder_entry.delete(0, "end")
+            self.folder_entry.configure(fg="#FFFFFF")
+
+    def _search_folder(self):
+        term = self.folder_entry.get().strip()
+        if not term or term.startswith("e.g."):
+            self._set_status("Enter a folder keyword first.", error=True)
+            return
+
+        self.folder_result.config(text="Searching...", fg="#888888")
+        self.update()
+
+        try:
+            matches = get_matching_folders(term)
+        except Exception as e:
+            self._set_status(f"Catalog error: {e}", error=True)
+            return
+
+        if not matches:
+            self.folder_result.config(text=f"✗ No folders found matching '{term}'", fg="#FF453A")
+            self._selected_folder_id = None
+            return
+
+        if len(matches) == 1:
+            self._selected_folder_id, self._selected_folder_path = matches[0]
+            short = self._selected_folder_path.split("/")[-2]
+            self.folder_result.config(text=f"✓ {short}", fg="#30D158")
+            self.folder_picker_frame.pack_forget()
+        else:
+            self._folder_matches = matches
+            self.folder_result.config(text=f"Found {len(matches)} folders — pick one:", fg="#FFD60A")
+            self.folder_listbox.delete(0, "end")
+            for _, fp in matches:
+                self.folder_listbox.insert("end", fp.split("/")[-2])
+            self.folder_picker_frame.pack(fill="x", pady=(4, 0))
+
+    def _pick_folder(self, event):
+        sel = self.folder_listbox.curselection()
+        if sel:
+            idx = sel[0]
+            self._selected_folder_id, self._selected_folder_path = self._folder_matches[idx]
+            short = self._selected_folder_path.split("/")[-2]
+            self.folder_result.config(text=f"✓ {short}", fg="#30D158")
+            self.folder_picker_frame.pack_forget()
+
+    def _run(self):
+        # Validate paste
+        raw = self.paste_box.get("1.0", "end-1c").strip()
+        if not raw or raw == "Paste your filenames here...":
+            self._set_status("Paste your Pixieset list first.", error=True)
+            return
+
+        # Validate folder
+        if not self._selected_folder_id:
+            self._set_status("Search and select a shoot folder first.", error=True)
+            return
+
+        # Parse filenames
+        filenames = parse_filenames(raw)
+        if not filenames:
+            self._set_status("No filenames found in pasted text.", error=True)
+            return
+
+        self._set_status(f"Backing up catalog and flagging {len(filenames)} photos...")
+        self.update()
+
+        # Backup
+        try:
+            backup_catalog()
+        except Exception as e:
+            self._set_status(f"Backup failed: {e}", error=True)
+            return
+
+        # Flag picks
+        try:
+            matched, not_found = flag_picks_in_catalog(filenames, self._selected_folder_id)
+        except Exception as e:
+            self._set_status(f"Error: {e}\nMake sure Lightroom is closed.", error=True)
+            return
+
+        # Result
+        msg = f"✓ {len(matched)} photos flagged as picks"
+        if not_found:
+            msg += f"\n✗ {len(not_found)} filenames not found in folder"
+        self._set_status(msg, error=len(matched) == 0)
+
+        if len(matched) > 0:
+            messagebox.showinfo(
+                "Done!",
+                f"{len(matched)} photos flagged as picks.\n\nOpen Lightroom to verify."
+            )
+
+    def _set_status(self, msg, error=False):
+        color = "#FF453A" if error else "#EBEBF5"
+        self.status.config(text=msg, fg=color)
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
+
 #!/bin/bash
 # Run this once to package LR_Pick_Flagger.py as a double-clickable Mac app
 # Usage: bash build_app.sh
